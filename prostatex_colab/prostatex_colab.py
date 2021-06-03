@@ -1,4 +1,5 @@
 """prostatex dataset."""
+import os
 from collections import defaultdict
 
 import pydicom
@@ -38,7 +39,7 @@ _CITATION = """
 class ProstateXConfig(tfds.core.BuilderConfig):
   """BuilderConfig for DeeplesionConfig."""
   def __init__(self,
-               name='nostack',
+               name=None,
                **kwargs):
     super(ProstateXConfig,
           self).__init__(name=name,
@@ -59,6 +60,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
     BUILDER_CONFIGS = [
         ProstateXConfig(
             name='nostack',
+            description=_DESCRIPTION,
+        ),
+        ProstateXConfig(
+            name='stack',
             description=_DESCRIPTION,
         ),
     ]
@@ -123,16 +128,16 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
     @staticmethod
     def add_to_overlay(image_overlay, image_overlay_ijk, images_row, image):  # add appropriate images to be overlaid
-        image_name = images_row[1]
+        image_name = images_row['Name']
         if 'diff' in image_name and 'ADC' in image_name:
             image_overlay['diff'] = np.squeeze(image)
-            image_overlay_ijk['diff'] = images_row[-9]
+            image_overlay_ijk['diff'] = images_row['ijk']
         elif 't2_tse_tra' in image_name:
             image_overlay['t2'] = np.squeeze(image)
-            image_overlay_ijk['t2'] = images_row[-9]
+            image_overlay_ijk['t2'] = images_row['ijk']
         elif 'tfl_3d_PD' in image_name:
             image_overlay['PD'] = np.squeeze(image)
-            image_overlay_ijk['PD'] = images_row[-9]
+            image_overlay_ijk['PD'] = images_row['ijk']
 
     @staticmethod
     def overlay_images(image_overlay, image_overlay_ijk):  # resize images and overlay them together
@@ -142,14 +147,16 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             row = img.shape[0]
             col = img.shape[1]
             mid = row - col
+            for i in range(len(ijk)):
+                ijk[i] = int(ijk[i])
             if row == col:
                 return
             elif row > col:
-                j = int(ijk[1]) - mid // 2
+                j = ijk[1] - mid // 2
                 image_overlay_ijk[tp] = "{0} {1} {2}".format(ijk[0], j, ijk[2])
                 image_overlay[tp] = img[mid // 2:row - mid // 2]
             else:
-                i = int(ijk[0]) + mid // 2
+                i = ijk[0] + mid // 2
                 image_overlay_ijk[tp] = "{0} {1} {2}".format(i, ijk[1], ijk[2])
                 image_overlay[tp] = np.array([row[- mid // 2: col + mid // 2] for row in img])
 
@@ -159,8 +166,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             i = round(int(ijk[0]) * max_resolution / image_overlay[tp].shape[0])
             j = round(int(ijk[1]) * max_resolution / image_overlay[tp].shape[0])
             image_overlay_ijk[tp] = "{0} {1} {2}".format(i, j, ijk[2])
-            ref_i = int(ref_ijk[0])
-            ref_j = int(ref_ijk[1])
+            ref_i = round(int(ref_ijk[0]))
+            ref_j = round(int(ref_ijk[1]))
             dj = ref_j - j
             di = ref_i - i
             img_shift = np.roll(img_resize, dj, axis=0)
@@ -201,6 +208,26 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         to_square('PD')
         to_square('ktran')
         return resize_and_overlay()
+
+    def get_ktran_image(self, ktran_row, path):
+        ProxID = ktran_row['ProxID']
+        mhd_path = path + '/KTran/ProstateXKtrains-train-fixed/{0}/{0}-Ktrans.mhd'.format(ProxID)
+        zraw_path = path + '/KTran/ProstateXKtrains-train-fixed/{0}/{0}-Ktrans.zraw'.format(ProxID)
+        ktran_mhd = tf.io.gfile.GFile(mhd_path, mode='rb')
+        temp = open('{0}-Ktrans.mhd'.format(ProxID), 'ab')
+        temp.write(ktran_mhd.read())
+        temp.close()
+        ktran_zraw = tf.io.gfile.GFile(zraw_path, mode='rb')
+        temp2 = open('{0}-Ktrans.zraw'.format(ProxID), 'ab')
+        temp2.write(ktran_zraw.read())
+        temp2.close()
+        itkimage = sitk.ReadImage(
+            '{0}-Ktrans.mhd'.format(ProxID), imageIO="MetaImageIO"
+        )
+        scan = sitk.GetArrayFromImage(itkimage)
+        os.remove('{0}-Ktrans.mhd'.format(ProxID))
+        os.remove('{0}-Ktrans.zraw'.format(ProxID))
+        return scan
 
     def _generate_examples(self, path):
         """Yields examples."""
@@ -246,7 +273,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 if metadata_buf_stack:
                     metadata_buf = metadata_buf_stack[-1]
                     if metadata_buf['Subject ID'] == ProxID:
-                        images_location[metadata_buf['Series Description']] = metadata_buf['File Location'][1:]
+                        images_location[metadata_buf['Series Description']] = metadata_buf['File Location'][11:]
                         metadata_buf_stack.pop()
                         for d_idx, dicom_metadata_row in dicom_metadata_reader:
                             if dicom_metadata_row['Subject ID'] != ProxID:
@@ -290,7 +317,6 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 self.add_to_overlay(image_overlay, image_overlay_ijk, images_row, image)
 
                 if self.builder_config.name == 'nostack':
-                    print('yielding')
                     yield str(ProxID) + str(fid) + images_row['Name'] + str(images_row['DCMSerNum']) + images_row['pos'], {
                         'image': np.expand_dims(image, axis=2),
                         'significant': significance,
@@ -301,57 +327,52 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                         'position': pos,
                         'ijk': images_row['ijk'],
                     }
-            break
+
             #yield KTRAN to tfds
-            '''
+
             if ProxID == 'ProstateX-0025':  # escape 25 which is corner case
                 next(ktran_reader)  # skip 2 lines as 2 entries for one finding in case 25
                 next(ktran_reader)
             else:
-                ktran_row = next(ktran_reader)
-                assert ktran_row[0] == ProxID and ktran_row[1] == fid
-                ijk = ktran_row[-1].split()
-                itkimage = sitk.ReadImage(
-                    path + '/ProstateXKtrains-train-fixed/{0}/{0}-Ktrans.mhd'.format(ProxID)
-                )
-                scan = sitk.GetArrayFromImage(itkimage)
+                k_idx, ktran_row = next(ktran_reader)
+                assert ktran_row['ProxID'] == ProxID and ktran_row['fid'] == fid
+                ijk = ktran_row['ijk'].split()
+                scan = self.get_ktran_image(ktran_row, path)
                 num_slices = scan.shape[0]
                 k = int(ijk[-1]) if int(ijk[-1]) < int(num_slices) else int(num_slices) - 1
                 k = 0 if k < 0 else k
                 ktran_img = np.squeeze(scan[k])
-                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 0)
-                image_overlay['ktran'] = (ktran_img * -10000).astype('uint16')  # make ktran scan more contrast
-                image_overlay_ijk['ktran'] = ktran_row[-1]
+                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 1000)
+                image_overlay['ktran'] = ((ktran_img + 1000) * 1000).astype('uint16')  # make ktran scan more contrast
+                image_overlay_ijk['ktran'] = ktran_row['ijk']
                 if self.builder_config.name == 'nostack':
-                    yield ProxID + fid + pos + '-ktran', {
-                        'image': np.expand_dims(image_overlay['ktran'], axis=-1),
+                    yield ProxID + str(fid) + pos + '-ktran', {
+                        'image': np.expand_dims(image_overlay['ktran'], axis=2),
                         'significant': significance,
-                        'zone': findings_row[-2],
+                        'zone': zone,
                         'DCMSerDescr': 'ktranFromDCE',
                         'ProxID': ProxID,
-                        'fid': fid,
+                        'fid': str(fid),
                         'position': pos,
-                        'ijk': ktran_row[-1],
+                        'ijk': ktran_row['ijk'],
                     }
-
             #  overlay images and yield
-
             if ProxID != 'ProstateX-0025' and self.builder_config.name == 'stack':
                 assert len(image_overlay.keys()) == 4
                 overlay_image = self.overlay_images(image_overlay, image_overlay_ijk)
-                yield ProxID + fid + pos + '-stack', {
+                yield ProxID + str(fid) + pos + '-stack', {
                     'image': overlay_image,
                     'significant': significance,
                     'zone': findings_row[-2],
                     'DCMSerDescr': 'stackFromDiffT2PDKtran',
                     'ProxID': ProxID,
-                    'fid': fid,
+                    'fid': str(fid),
                     'position': pos,
                     'ijk': ' '.join(image_overlay_ijk['ref']),
                 }
-            '''
+
             prevID = ProxID  # update prevID
             itera += 1
-            if itera >= 10:
+            if itera >= 20:
                 break
 

@@ -310,8 +310,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 k = int(ijk[-1]) if int(ijk[-1]) < int(num_slices) else int(num_slices) - 1
                 k = 0 if k < 0 else k
                 ktran_img = np.squeeze(scan[k])
-                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 0)
-                image_overlay['ktran'] = (ktran_img * -10000).astype('uint16')  # make ktran scan more contrast
+                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 10000)
+                image_overlay['ktran'] = ((ktran_img + 1000) * 1000).astype('uint16')  # make ktran scan more contrast
                 image_overlay_ijk['ktran'] = ktran_row[-1]
                 if self.builder_config.name == 'nostack':
                     yield ProxID + fid + pos + '-ktran', {
@@ -343,5 +343,5 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
             prevID = ProxID  # update prevID
             iter += 1
-            if iter >= 400:
+            if iter >= 10:
                 break
