@@ -31,15 +31,18 @@ _CITATION = """
                 }
 """
 
+
 class ProstateXConfig(tfds.core.BuilderConfig):
-  """BuilderConfig for DeeplesionConfig."""
-  def __init__(self,
-               name=None,
-               **kwargs):
-    super(ProstateXConfig,
-          self).__init__(name=name,
-                         version=tfds.core.Version('1.0.0'),
-                         **kwargs)
+    """BuilderConfig for DeeplesionConfig."""
+
+    def __init__(self,
+                 name=None,
+                 **kwargs):
+        super(ProstateXConfig,
+              self).__init__(name=name,
+                             version=tfds.core.Version('1.0.0'),
+                             **kwargs)
+
 
 class Prostatex(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for prostatex dataset."""
@@ -54,11 +57,15 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
       """
     BUILDER_CONFIGS = [
         ProstateXConfig(
-            name='nostack',
+            name='volume',
             description=_DESCRIPTION,
         ),
         ProstateXConfig(
             name='stack',
+            description=_DESCRIPTION,
+        ),
+        ProstateXConfig(
+            name='nostack',
             description=_DESCRIPTION,
         ),
     ]
@@ -66,10 +73,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
     def _info(self) -> tfds.core.DatasetInfo:
         """Returns the dataset metadata."""
         # TODO(prostatex): Specifies the tfds.core.DatasetInfo object
-        return tfds.core.DatasetInfo(
-            builder=self,
-            description=_DESCRIPTION,
-            features=tfds.features.FeaturesDict({
+        if self.builder_config.name == 'stack' or self.builder_config.name == 'nostack':
+            features = tfds.features.FeaturesDict({
                 # These are the features of your dataset like images, labels ...
                 'image': tfds.features.Image(shape=(None, None, None), dtype=tf.uint16),
                 'significant': tfds.features.ClassLabel(names=['TRUE', 'FALSE']),
@@ -81,7 +86,25 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 'position': tfds.features.Text(),
                 'ijk': tfds.features.Text(),
                 # TODO: ijk to tfds.feature.bbox; alignment; deploy in colab
-            }),
+            })
+        elif self.builder_config.name == 'volume':
+            features = tfds.features.FeaturesDict({
+                # These are the features of your dataset like images, labels ...
+                'image': tfds.features.Sequence(tfds.features.Image(shape=(None, None, None), dtype=tf.uint16)),
+                'significant': tfds.features.Sequence(tfds.features.ClassLabel(names=['TRUE', 'FALSE'])),
+                'zone': tfds.features.Sequence(tfds.features.ClassLabel(names=['PZ', 'AS', 'TZ', 'SV'])),
+                # TODO: image type should be in configure builder
+                'DCMSerDescr': tfds.features.Text(),
+                'ProxID': tfds.features.Text(),
+                'fid': tfds.features.Sequence(tfds.features.Text()),
+                'position': tfds.features.Sequence(tfds.features.Text()),
+                'ijk': tfds.features.Sequence(tfds.features.Text()),
+                # TODO: ijk to tfds.feature.bbox; alignment; deploy in colab
+            })
+        return tfds.core.DatasetInfo(
+            builder=self,
+            description=_DESCRIPTION,
+            features=features,
             # If there's a common (input, target) tuple from the
             # features, specify them here. They'll be used if
             # `as_supervised=True` in `builder.as_dataset`.
@@ -120,6 +143,20 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         return image
 
     @staticmethod
+    def get_image_series(num_slice, path, images_location, DCMSerDescr):
+        img_list = []
+        for k in range(1, num_slice + 1):
+            if int(k) < 10 and int(num_slice) >= 10:
+                file_name = "1-0{0}.dcm".format(k)
+            else:
+                file_name = "1-{0}.dcm".format(k)
+            image_bytes = tf.io.read_file(path + '/manifest-hjL8tlLc1556886850502670511' + images_location[
+                DCMSerDescr.replace("_", "").replace("=", "")] + '/' + file_name)
+            image = tfio.image.decode_dicom_image(image_bytes, dtype=tf.uint16)
+            img_list.append(np.squeeze(image, axis=0))
+        return img_list
+
+    @staticmethod
     def add_to_overlay(image_overlay, image_overlay_ijk, images_row, image):  # add appropriate images to be overlaid
         image_name = images_row[1]
         if 'diff' in image_name and 'ADC' in image_name:
@@ -152,7 +189,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 image_overlay[tp] = np.array([row[- mid // 2: col + mid // 2] for row in img])
 
         def zoom_and_shift(tp, max_resolution, ref_ijk):
-            img_resize = scipy.ndimage.interpolation.zoom(np.squeeze(image_overlay[tp]), max_resolution / image_overlay[tp].shape[0])
+            img_resize = scipy.ndimage.interpolation.zoom(np.squeeze(image_overlay[tp]),
+                                                          max_resolution / image_overlay[tp].shape[0])
             ijk = image_overlay_ijk[tp].split()
             i = round(int(ijk[0]) * max_resolution / image_overlay[tp].shape[0])
             j = round(int(ijk[1]) * max_resolution / image_overlay[tp].shape[0])
@@ -184,7 +222,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 return image_overlay_ijk['ktran'].split()
 
         def resize_and_overlay():
-            diff_img, t2_img, PD_img, ktran_img = image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], image_overlay['ktran']
+            diff_img, t2_img, PD_img, ktran_img = image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], \
+                                                  image_overlay['ktran']
             max_resolution = max(diff_img.shape[0], t2_img.shape[0], PD_img.shape[0], ktran_img.shape[0])
             ref_ijk = get_largest_image(max_resolution)
             zoom_and_shift('diff', max_resolution, ref_ijk)
@@ -192,7 +231,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             zoom_and_shift('PD', max_resolution, ref_ijk)
             zoom_and_shift('ktran', max_resolution, ref_ijk)
             image_overlay_ijk['ref'] = ref_ijk
-            return np.stack([image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], image_overlay['ktran']], axis=-1)
+            return np.stack([image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], image_overlay['ktran']],
+                            axis=-1)
 
         to_square('diff')
         to_square('t2')
@@ -221,13 +261,62 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         iter = 0
         prevID = 'ProstateX--1'  # fake prevID as an initializer
         images_location = {}
+        images_number = {}
+        images_ijk = defaultdict(list)
         metadata_buf_stack = []
         image_buf_stack = []
+
+        fid_list = []
+        pos_list = []
+        zone_list = []
+        significance_list = []
+        ktran_ijk_list = []
+        scan = None
 
         # for each finding, get its corresponding images and their paths
 
         for findings_row in findings_reader:
-            ProxID, fid, pos, significance = findings_row[0], findings_row[1], findings_row[2], findings_row[-1]
+            ProxID, fid, pos, zone, significance = findings_row[0], findings_row[1], findings_row[2], findings_row[-2], \
+                                                   findings_row[-1]
+
+            # generate volume images
+            if prevID != ProxID and len(images_location) > 0:  # implicitly ktran scan is not None
+                if self.builder_config.name == 'volume':
+                    for key in images_location:
+                        image_series = self.get_image_series(images_number[key], path, images_location, key)
+                        yield prevID + key + '-volume', {
+                            'image': image_series,
+                            'significant': significance_list,
+                            'zone': zone_list,
+                            'DCMSerDescr': key,
+                            'ProxID': prevID,
+                            'fid': fid_list,
+                            'position': pos_list,
+                            'ijk': images_ijk[key],
+                        }
+                    ktran_images = []
+                    for slice in scan:
+                        ktran_slice = np.squeeze(slice)
+                        ktran_slice = where(ktran_slice != 0, np.log10(ktran_slice), 1000)
+                        ktran_slice = ((ktran_slice + 1000) * 1000).astype('uint16')
+                        ktran_images.append(np.expand_dims(ktran_slice, axis=2))
+                    yield prevID + '-ktran' + '-volume', {
+                        'image': ktran_images,
+                        'significant': significance_list,
+                        'zone': zone_list,
+                        'DCMSerDescr': 'ktranFromDCE',
+                        'ProxID': prevID,
+                        'fid': fid_list,
+                        'position': pos_list,
+                        'ijk': ktran_ijk_list,
+                    }
+                    significance_list, zone_list, fid_list, pos_list, images_ijk, ktran_ijk_list = [], [], [], [], defaultdict(list), []  # clean the data
+                    # of prevID
+
+            fid_list.append(fid)
+            pos_list.append(pos)
+            zone_list.append(zone)
+            significance_list.append(significance)
 
             # set up the dictionary to map DCMSerDescr to path referred in metadata.csv
 
@@ -237,18 +326,21 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                     metadata_buf = metadata_buf_stack[-1]
                     if metadata_buf[4] == ProxID:
                         images_location[metadata_buf[8]] = metadata_buf[15][1:]
+                        images_number[metadata_buf[8]] = int(metadata_buf[13])
                         metadata_buf_stack.pop()
                         for dicom_metadata_row in dicom_metadata_reader:
                             if dicom_metadata_row[4] != ProxID:
                                 metadata_buf_stack.append(dicom_metadata_row)
                                 break
                             images_location[dicom_metadata_row[8]] = dicom_metadata_row[15][1:]
+                            images_number[dicom_metadata_row[8]] = int(dicom_metadata_row[13])
                 else:
                     for dicom_metadata_row in dicom_metadata_reader:
                         if dicom_metadata_row[4] != ProxID:
                             metadata_buf_stack.append(dicom_metadata_row)
                             break
                         images_location[dicom_metadata_row[8]] = dicom_metadata_row[15][1:]
+                        images_number[dicom_metadata_row[8]] = int(dicom_metadata_row[13])
 
             # for each finding image, decode it and yield to tfds
 
@@ -260,6 +352,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 if ProxID != 'ProstateX-0025':  # 25 has a unique corner case
                     image = self.get_image(images_row, path, images_location)
                     self.add_to_overlay(image_overlay, image_overlay_ijk, images_row, image)
+                    if images_row[-9] not in images_ijk[images_row[-2].replace('_', '').replace('=', '')]:
+                        images_ijk[images_row[-2].replace('_', '').replace('=', '')].append(images_row[-9])
                     if self.builder_config.name == 'nostack':
                         yield ProxID + fid + images_row[1] + images_row[-1] + images_row[3], {
                             'image': image.numpy()[0],
@@ -280,7 +374,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
                 image = self.get_image(images_row, path, images_location)
                 self.add_to_overlay(image_overlay, image_overlay_ijk, images_row, image)
-
+                if images_row[-9] not in images_ijk[images_row[-2].replace('_', '').replace('=', '')]:
+                    images_ijk[images_row[-2].replace('_', '').replace('=', '')].append(images_row[-9])
                 if self.builder_config.name == 'nostack':
                     yield ProxID + fid + images_row[1] + images_row[-1] + images_row[3], {
                         'image': image.numpy()[0],
@@ -310,7 +405,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 k = int(ijk[-1]) if int(ijk[-1]) < int(num_slices) else int(num_slices) - 1
                 k = 0 if k < 0 else k
                 ktran_img = np.squeeze(scan[k])
-                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 10000)
+                ktran_img = where(ktran_img != 0, np.log10(ktran_img), 1000)
                 image_overlay['ktran'] = ((ktran_img + 1000) * 1000).astype('uint16')  # make ktran scan more contrast
                 image_overlay_ijk['ktran'] = ktran_row[-1]
                 if self.builder_config.name == 'nostack':
@@ -324,6 +419,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                         'position': pos,
                         'ijk': ktran_row[-1],
                     }
+                ktran_ijk_list.append(ktran_row[-1])
+                # TODO: correct ktran volume
 
             #  overlay images and yield
 
@@ -343,5 +440,36 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
             prevID = ProxID  # update prevID
             iter += 1
-            if iter >= 10:
+            if iter >= 2:
                 break
+
+        # process the last ProxID's
+        if self.builder_config.name == 'volume':
+            for key in images_location:
+                image_series = self.get_image_series(images_number[key], path, images_location, key)
+                yield prevID + key + '-volume', {
+                    'image': image_series,
+                    'significant': significance_list,
+                    'zone': zone_list,
+                    'DCMSerDescr': key,
+                    'ProxID': prevID,
+                    'fid': fid_list,
+                    'position': pos_list,
+                    'ijk': images_ijk[key],
+                }
+            ktran_images = []
+            for slice in scan:
+                ktran_slice = np.squeeze(slice)
+                ktran_slice = where(ktran_slice != 0, np.log10(ktran_slice), 1000)
+                ktran_slice = ((ktran_slice + 1000) * 1000).astype('uint16')
+                ktran_images.append(np.expand_dims(ktran_slice, axis=2))
+            yield prevID + '-ktran' + '-volume', {
+                    'image': ktran_images,
+                    'significant': significance_list,
+                    'zone': zone_list,
+                    'DCMSerDescr': 'ktranFromDCE',
+                    'ProxID': prevID,
+                    'fid': fid_list,
+                    'position': pos_list,
+                    'ijk': ktran_ijk_list,
+            }
