@@ -89,6 +89,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 'fid': tfds.features.Text(),
                 'position': tfds.features.Text(),
                 'ijk': tfds.features.Text(),
+                'bbox': tfds.features.BBoxFeature(),
                 # TODO: ijk to tfds.feature.bbox; alignment; deploy in colab
             })
         elif self.builder_config.name == 'volume':
@@ -104,6 +105,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 'fid': tfds.features.Sequence(tfds.features.Text()),
                 'position': tfds.features.Sequence(tfds.features.Text()),
                 'ijk': tfds.features.Sequence(tfds.features.Text()),
+                'bbox': tfds.features.Sequence(tfds.features.BBoxFeature()),
                 # TODO: ijk to tfds.feature.bbox; alignment; deploy in colab
             })
         return tfds.core.DatasetInfo(
@@ -139,12 +141,11 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
     @staticmethod
     def get_image(DCMSerDescr, ijk, path, images_location, images_number):
-        #DCMSerDescr = images_row[-2].replace("_", "").replace("=", "")
-        #ijk = images_row[-9]  # k means kth slices in the series
         ijk = ijk.split()
 
-        k = int(ijk[-1]) + 1 if int(ijk[-1]) < int(images_number[DCMSerDescr]) else int(images_number[DCMSerDescr])
-        k = 1 if k < 1 else k
+        k = int(ijk[-1]) if int(ijk[-1]) < int(images_number[DCMSerDescr]) else int(images_number[DCMSerDescr]) - 1
+        k = 0 if k < 0 else k
+        k = int(images_number[DCMSerDescr]) - k
         if int(k) < 10 and int(images_number[DCMSerDescr]) >= 10:
             file_name = "1-0{0}.dcm".format(k)
         else:
@@ -154,12 +155,13 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         ds = pydicom.dcmread(f)
         img = ds.pixel_array
         spacing = ds[0x28, 0x30].value
-        return img, spacing
+        origin = ds[0x20, 0x32].value
+        return img, spacing, origin
 
     @staticmethod
     def get_image_series(num_slice, path, images_location, DCMSerDescr):
-        img_list = []
-        for k in range(1, num_slice + 1):
+        img_list, img_origin, img_spacing = [], None, None
+        for k in range(num_slice, 0, -1):
             if int(k) < 10 and int(num_slice) >= 10:
                 file_name = "1-0{0}.dcm".format(k)
             else:
@@ -170,7 +172,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             ds = pydicom.dcmread(f)
             img = ds.pixel_array
             img_list.append(np.expand_dims(img, axis=2))
-        return img_list
+            if k == num_slice:
+                img_origin = ds[0x20, 0x32].value
+                img_spacing = ds[0x28, 0x30].value
+        return img_list, img_origin, img_spacing
 
     @staticmethod
     def get_ktran_series(scan):
@@ -182,109 +187,109 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             ktran_images.append(np.expand_dims(ktran_slice, axis=2))
         return ktran_images
 
+    def resample_image(self, itk_image, ref_image):
+        out_spacing = ref_image.GetSpacing()
+        out_size = ref_image.GetSize()
+        resample = sitk.ResampleImageFilter()
+        resample.SetOutputSpacing(out_spacing)
+        resample.SetSize(out_size)
+        resample.SetOutputDirection(itk_image.GetDirection())
+        resample.SetOutputOrigin(ref_image.GetOrigin())
+        resample.SetTransform(sitk.Transform())
+        resample.SetDefaultPixelValue(itk_image.GetPixelIDValue())
+        resample.SetInterpolator(sitk.sitkLinear)  # sitkBSpline)
+
+        return resample.Execute(itk_image)
+
+    def get_resample(self, images_location, path, images_number, images_voxelspacing, ktran_itk):
+        diff_itk, t2_itk, pd_itk = None, None, None
+        for key in images_location:
+            if ('diff' in key or 'DIFF' in key) and 'ADC' in key:
+                diff_imgs, diff_origin, diff_spacing = self.get_image_series(images_number[key], path, images_location, key)
+                diff_imgs = np.array(diff_imgs)
+                diff_itk = sitk.GetImageFromArray(diff_imgs)
+                diff_itk.SetOrigin(diff_origin)
+                diff_itk.SetSpacing(images_voxelspacing[key])
+            elif 't2tsetra' in key:
+                t2_imgs, t2_origin, t2_spacing = self.get_image_series(images_number[key], path, images_location, key)
+                t2_imgs = np.array(t2_imgs)
+                t2_itk = sitk.GetImageFromArray(t2_imgs)
+                t2_itk.SetOrigin(t2_origin)
+                t2_itk.SetSpacing(images_voxelspacing[key])
+            elif 'PD' in key and '3d' in key:
+                pd_imgs, pd_origin, pd_spacing = self.get_image_series(images_number[key], path, images_location, key)
+                pd_imgs = np.array(pd_imgs)
+                pd_itk = sitk.GetImageFromArray(pd_imgs)
+                pd_itk.SetOrigin(pd_origin)
+                pd_itk.SetSpacing(images_voxelspacing['PD'] if key not in images_voxelspacing else images_voxelspacing[key])
+        diff_resample = self.resample_image(diff_itk, ktran_itk)
+        diff_new = sitk.GetArrayFromImage(diff_resample)
+        t2_resample = self.resample_image(t2_itk, ktran_itk)
+        t2_new = sitk.GetArrayFromImage(t2_resample)
+        pd_resample = self.resample_image(pd_itk, ktran_itk)
+        pd_new = sitk.GetArrayFromImage(pd_resample)
+        ktran_scan = sitk.GetArrayFromImage(ktran_itk)
+        img_stack_volume = []
+        for i in range(len(ktran_scan)):
+            stacki = np.stack((diff_new[i], t2_new[i], pd_new[i], ktran_scan[i]), axis=-1)
+            img_stack_volume.append(stacki.astype('uint16'))
+        return img_stack_volume
+
+    def get_itk(self, image, spacing, origin):
+        itkimage = sitk.GetImageFromArray(image)
+        itkimage.SetSpacing(spacing)
+        itkimage.SetOrigin(origin)
+        return itkimage
+
+    def get_2d_resample(self, image_overlay, image_spacing, image_origin):
+        diff_itk = self.get_itk(image_overlay['diff'], image_spacing['diff'], image_origin['diff'])
+        t2_itk = self.get_itk(image_overlay['t2'], image_spacing['t2'], image_origin['t2'])
+        PD_itk = self.get_itk(image_overlay['PD'], image_spacing['PD'], image_origin['PD'])
+        ktran_itk = self.get_itk(image_overlay['ktran'], image_spacing['ktran'], image_origin['ktran'])
+        diff_resample = self.resample_image(diff_itk, ktran_itk)
+        t2_resample = self.resample_image(t2_itk, ktran_itk)
+        PD_resample = self.resample_image(PD_itk, ktran_itk)
+        return np.stack((sitk.GetArrayFromImage(diff_resample), sitk.GetArrayFromImage(t2_resample), sitk.GetArrayFromImage(PD_resample), sitk.GetArrayFromImage(ktran_itk)), axis=-1)
+
+
+
+    def get_bbox(self, ijk, shape):
+        ijk = ijk.split()
+        ymin = (float(ijk[1]) - 5) / shape[0]
+        xmin = (float(ijk[0]) - 5) / shape[1]
+        ymax = (float(ijk[1]) + 5) / shape[0]
+        xmax = (float(ijk[0]) + 5) / shape[1]
+        if ymin < 0: ymin = 0.0
+        if xmin < 0: xmin = 0.0
+        if ymax > 1: ymax = 1.0
+        if xmax > 1: xmax = 1.0
+        return tfds.features.BBox(ymin=ymin, xmin=xmin, ymax=ymax, xmax=xmax)
+
+    def get_bbox_list(self, ijk_list, shape):
+        bbox_list = []
+        for ijk in ijk_list:
+            ymin, xmin, ymax, xmax = self.get_bbox(ijk, shape)
+            bbox_list.append(tfds.features.BBox(ymin=ymin, xmin=xmin, ymax=ymax, xmax=xmax))
+        return bbox_list
+
     @staticmethod
-    def add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_name, ijk, image, spacing):  # add appropriate images to be overlaid
+    def add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_origin, image_name, ijk, image, spacing, origin):  # add appropriate images to be overlaid
         if ('diff' in image_name or 'DIFF' in image_name) and 'ADC' in image_name:
             image_overlay['diff'] = np.squeeze(image)
             image_overlay_ijk['diff'] = ijk
-            image_spacing['diff'] = float(spacing[0])
+            image_spacing['diff'] = tuple([float(i) for i in spacing])
+            image_origin['diff'] = tuple([float(i) for i in origin[:2]])
         elif 't2_tse_tra' in image_name:
             image_overlay['t2'] = np.squeeze(image)
             image_overlay_ijk['t2'] = ijk
-            image_spacing['t2'] = float(spacing[0])
+            image_spacing['t2'] = tuple([float(i) for i in spacing])
+            image_origin['t2'] = tuple([float(i) for i in origin[:2]])
         elif 'PD' in image_name and '3d' in image_name:
             image_overlay['PD'] = np.squeeze(image)
             image_overlay_ijk['PD'] = ijk
-            image_spacing['PD'] = float(spacing[0])
-    @staticmethod
-    def overlay_images(image_overlay, image_overlay_ijk, image_spacing):  # resize images and overlay them together
-        def to_square(tp):
-            img = image_overlay[tp]
-            ijk = image_overlay_ijk[tp].split()
-            row = img.shape[0]
-            col = img.shape[1]
-            mid = row - col
-
-            if row == col:
-                return
-            elif row > col:
-                i = int(ijk[0]) + mid // 2
-                image_overlay_ijk[tp] = "{0} {1} {2}".format(i, ijk[1], ijk[2])
-                zeros = np.zeros((row, mid // 2), dtype=img.dtype)
-                new_img = np.concatenate((zeros, img, zeros), axis=1)
-                image_overlay[tp] = new_img
-            else:
-                j = int(ijk[1]) - mid // 2
-                image_overlay_ijk[tp] = "{0} {1} {2}".format(ijk[0], j, ijk[2])
-                zeros = np.zeros((-mid // 2, col), dtype=img.dtype)
-                new_img = np.concatenate((zeros, img, zeros), axis=0)
-                image_overlay[tp] = new_img
-
-        def zoom_and_shift(tp, max_resolution, ref_ijk, max_mode):
-            coefficient = image_spacing[tp] * np.shape(image_overlay[tp])[0] / (max_resolution * image_spacing[max_mode])
-            img_resize = scipy.ndimage.zoom(np.squeeze(image_overlay[tp]),
-                                                          max_resolution * coefficient / image_overlay[tp].shape[0])
-            ijk = image_overlay_ijk[tp].split()
-            i = round(int(ijk[0]) * max_resolution * coefficient / image_overlay[tp].shape[0])
-            j = round(int(ijk[1]) * max_resolution * coefficient / image_overlay[tp].shape[0])
-            image_overlay_ijk[tp] = "{0} {1} {2}".format(i, j, ijk[2])
-            ref_i = int(ref_ijk[0])
-            ref_j = int(ref_ijk[1])
-            if coefficient == 1:
-                img_shift = img_resize
-            elif coefficient > 1:
-                this_resolution = np.shape(img_resize)[0]
-                zeros = np.zeros((this_resolution, 50), dtype=img_resize.dtype)
-                img_add_col = np.concatenate((zeros, img_resize, zeros), axis=1)
-                zeros = np.zeros((50, this_resolution + 100), dtype=img_resize.dtype)
-                img_add_row = np.concatenate((zeros, img_add_col, zeros), axis=0)
-                new_j, new_i = j + 50, i + 50
-                img_cut_row = img_add_row[new_j - ref_j:new_j - ref_j + max_resolution] #cut rows
-                img_shift = np.array([row[new_i - ref_i:new_i - ref_i + max_resolution] for row in img_cut_row]) # cut columns
-            elif coefficient < 1:
-                this_resolution = np.shape(img_resize)[0]
-                zeros = np.zeros((this_resolution, (max_resolution + 100 - this_resolution) // 2), dtype=img_resize.dtype)
-                img_add_col = np.concatenate((zeros, img_resize, zeros), axis=1)
-                zeros = np.zeros(((max_resolution + 100 - this_resolution) // 2, max_resolution + 100), dtype=img_add_col.dtype)
-                img_add_row = np.concatenate((zeros, img_add_col, zeros), axis=0)
-                new_i, new_j = i + max_resolution + 50 - this_resolution, j + max_resolution + 50 - this_resolution
-                dj, di = ref_j - new_j, ref_i - new_i
-                img_cut_row = img_add_row[new_j - ref_j:new_j - ref_j + max_resolution]  # cut rows
-                img_shift = np.array([row[new_i - ref_i:new_i - ref_i + max_resolution] for row in img_cut_row])  # cut columns
-            image_overlay[tp] = img_shift
-
-        def get_largest_image(max_resolution):
-            if image_overlay['diff'].shape[0] == max_resolution:
-                return image_overlay_ijk['diff'].split(), 'diff'
-            if image_overlay['t2'].shape[0] == max_resolution:
-                return image_overlay_ijk['t2'].split(), 't2'
-            if image_overlay['PD'].shape[0] == max_resolution:
-                return image_overlay_ijk['PD'].split(), 'PD'
-            if image_overlay['ktran'].shape[0] == max_resolution:
-                return image_overlay_ijk['ktran'].split(), 'tran'
-
-        def resize_and_overlay():
-            diff_img, t2_img, PD_img, ktran_img = image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], \
-                                                  image_overlay['ktran']
-            max_resolution = max(diff_img.shape[0], t2_img.shape[0], PD_img.shape[0], ktran_img.shape[0])
-            ref_ijk, max_mode = get_largest_image(max_resolution)
-            zoom_and_shift('diff', max_resolution, ref_ijk, max_mode)
-            zoom_and_shift('t2', max_resolution, ref_ijk, max_mode)
-            zoom_and_shift('PD', max_resolution, ref_ijk, max_mode)
-            zoom_and_shift('ktran', max_resolution, ref_ijk, max_mode)
-            image_overlay_ijk['ref'] = ref_ijk
-            try:
-                assert image_overlay['diff'].shape == image_overlay['t2'].shape == image_overlay['PD'].shape == image_overlay['ktran'].shape
-            except AssertionError:
-                print(max_resolution)
-                print(max_mode)
-                print(ref_ijk)
-            return np.stack([image_overlay['diff'], image_overlay['t2'], image_overlay['PD'], image_overlay['ktran']], axis=-1)
-        to_square('diff')
-        to_square('t2')
-        to_square('PD')
-        to_square('ktran')
-        return resize_and_overlay()
+            image_spacing['PD'] = tuple([float(i) for i in spacing])
+            image_origin['PD'] = tuple([float(i) for i in origin[:2]])
+            image_origin['ktran'] = image_origin['PD'] # since the offset is changing along the z-axis, use PD and ktran referring to each other is more accurate
 
     def _generate_examples(self, path, file_paths):
         #path the the absolute path to parent dir of all files, file_paths includes: 1.path to dycom images 2.path to metadata 3.path to mhd images
@@ -302,19 +307,17 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         # open all .csv files to locate desired images
         findings_reader = self.get_csv_iter(FINDINGS_PATH)
         ggg_findings_reader = self.get_csv_iter(GGG_FINDINGS_PATH)
-        images_reader = csv.reader(open(IMAGES_PATH, newline=''), delimiter=',', quotechar='|')
-        next(images_reader)
-        dicom_metadata_reader = csv.reader(open(DICOM_METADATA_PATH, newline=''), delimiter=',', quotechar='|')
-        next(dicom_metadata_reader)
-        ktran_reader = csv.reader(open(KTRAN_PATH, newline=''), delimiter=',', quotechar='|')
-        next(ktran_reader)
+        images_reader = self.get_csv_iter(IMAGES_PATH)
+        dicom_metadata_reader = self.get_csv_iter(DICOM_METADATA_PATH)
+        ktran_reader = self.get_csv_iter(KTRAN_PATH)
         iter = 0
         prevID = 'ProstateX--1'  # fake prevID as an initializer
-        images_location, images_number, images_ijk = {}, {}, defaultdict(list)
+        images_location, images_number, images_ijk, images_voxelspacing = {}, {}, defaultdict(list), defaultdict(tuple)
         metadata_buf_stack, image_buf_stack = [], []
         fid_list, pos_list, zone_list, significance_list, ktran_ijk_list, ggg_list = [], [], [], [], [], []
-        scan = None
+        ktran_itk, scan = None, None # ktran origin and scan set to None
         ggg_exist, ggg_dic = set(), {}
+
 
         # read the ggg of some findings from prostatex2
         for g_idx, ggg_findings_row in ggg_findings_reader:
@@ -333,7 +336,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             if prevID != ProxID and len(images_location) > 0:  # implicitly ktran scan is not None
                 if self.builder_config.name == 'volume':
                     for key in images_location:
-                        image_series = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
+                        image_series, img_origin, img_spacing = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
+                        bbox_list = self.get_bbox_list(images_ijk[key], np.shape(image_series[0]))
                         yield prevID + key + '-volume', {
                             'image': image_series,
                             'significant': significance_list,
@@ -344,8 +348,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                             'fid': fid_list,
                             'position': pos_list,
                             'ijk': images_ijk[key],
+                            'bbox': bbox_list,
                         }
                     ktran_images = self.get_ktran_series(scan)
+                    bbox_list = self.get_bbox_list(ktran_ijk_list, np.shape(ktran_images[0]))
                     yield prevID + '-ktran' + '-volume', {
                         'image': ktran_images,
                         'significant': significance_list,
@@ -356,6 +362,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                         'fid': fid_list,
                         'position': pos_list,
                         'ijk': ktran_ijk_list,
+                        'bbox': bbox_list,
                     }
                     significance_list, zone_list, fid_list, pos_list, images_ijk, ktran_ijk_list, ggg_list = [], [], [], [], defaultdict(
                         list), [], []  # clean the data
@@ -371,59 +378,63 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
             if prevID != ProxID:  # if ProxID equals to prevID, use the last dictionary
                 images_location, tmp_dicom_metadata = {}, None
-                for dicom_metadata_row in dicom_metadata_reader:
-                    if dicom_metadata_row[4] != ProxID:
+                for d_idx, dicom_metadata_row in dicom_metadata_reader:
+                    if dicom_metadata_row['Subject ID'] != ProxID:
                         tmp_dicom_metadata = dicom_metadata_row
                         break
                     metadata_buf_stack.append(dicom_metadata_row)
                 len_metadata_buf_stack = len(metadata_buf_stack)
                 for i in range(len_metadata_buf_stack):
                     metadata_buf = metadata_buf_stack.pop()
-                    images_location[metadata_buf[8]] = metadata_buf[15][1:]
-                    images_number[metadata_buf[8]] = int(metadata_buf[13])
+                    images_location[metadata_buf['Series Description']] = metadata_buf['File Location'][1:]
+                    images_number[metadata_buf['Series Description']] = int(metadata_buf['Number of Images'])
                 if tmp_dicom_metadata is not None: metadata_buf_stack.append(tmp_dicom_metadata)
             # for each finding nostack image, decode it and yield to tfds
 
-            image_overlay, image_overlay_ijk, image_spacing = defaultdict(lambda: np.ndarray(0)), {}, {}
+            image_overlay, image_overlay_ijk, image_spacing, image_origin = defaultdict(lambda: np.ndarray(0)), {}, defaultdict(tuple), defaultdict(tuple)
             temp_image = None
-            for images_row in images_reader:
-                if images_row[0] != ProxID or images_row[2] != fid or images_row[3] != pos:
-                    #  when reading image of next ProxID, process all the images_row in stack for this ProxID
+            for i_idx, images_row in images_reader:
+                if images_row['ProxID'] != ProxID or str(images_row['fid']) != fid or images_row['pos'] != pos:
                     temp_image = images_row
                     break
                 image_buf_stack.append(images_row)
             len_image_buf_stack = len(image_buf_stack)
             for i in range(len_image_buf_stack):
                 image_row = image_buf_stack.pop()
-                assert image_row[0] == ProxID and image_row[2] == fid and image_row[3] == pos
-                DCMSerDes, ijk, image_name = image_row[-2].replace('_', '').replace('=', ''), image_row[-9], image_row[1]
-                image, spacing = self.get_image(DCMSerDes, ijk, path + dycom_path, images_location, images_number)
-                self.add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_name, ijk, image, spacing)
+                assert image_row['ProxID'] == ProxID and str(image_row['fid']) == fid and image_row['pos'] == pos
+                DCMSerDes, ijk, image_name = image_row['DCMSerDescr'].replace('_', '').replace('=', ''), image_row['ijk'], image_row['Name']
+                voxelspacing = image_row['VoxelSpacing'].split(',')
+                images_voxelspacing[DCMSerDes] = tuple([float(i) for i in voxelspacing])
+                image, spacing, origin = self.get_image(DCMSerDes, ijk, path + dycom_path, images_location, images_number)
+                self.add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_origin, image_name, ijk, image, spacing, origin)
                 if ijk not in images_ijk[DCMSerDes]:
-                    images_ijk[DCMSerDes].append(image_row[-9])
+                    images_ijk[DCMSerDes].append(ijk)
                 if self.builder_config.name == 'nostack':
-                    yield ProxID + fid + image_row[1] + image_row[-1] + image_row[3], {
+                    bbox = self.get_bbox(ijk, np.shape(image))
+                    yield ProxID + fid + image_name + str(image_row['DCMSerNum']) + pos, {
                             'image': np.expand_dims(image, axis=2),
                             'significant': significance,
                             'ggg': ggg,
                             'zone': zone,
-                            'DCMSerDescr': image_row[-2],
+                            'DCMSerDescr': DCMSerDes,
                             'ProxID': ProxID,
                             'fid': fid,
                             'position': pos,
-                            'ijk': image_row[-9],
+                            'ijk': ijk,
+                            'bbox': bbox,
                     }
             if temp_image is not None: image_buf_stack.append(temp_image)
 
             # yield KTRAN nostack to tfds
 
 
-            ktran_row = next(ktran_reader)
-            assert ktran_row[0] == ProxID and ktran_row[1] == fid
-            ijk = ktran_row[-1].split()
+            k_idx, ktran_row = next(ktran_reader)
+            assert ktran_row['ProxID'] == ProxID and str(ktran_row['fid']) == fid
+            ijk = ktran_row['ijk'].split()
             itkimage = sitk.ReadImage(
                 path + mhd_path + '/{0}/{0}-Ktrans.mhd'.format(ProxID)
             )
+            ktran_itk = itkimage
             scan = sitk.GetArrayFromImage(itkimage)
             ktran_spacing = itkimage.GetSpacing()
             num_slices = scan.shape[0]
@@ -432,9 +443,12 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             ktran_img = np.squeeze(scan[k])
             ktran_img = where(ktran_img != 0, np.log10(ktran_img), 1000)
             image_overlay['ktran'] = ((ktran_img + 1000) * 1000).astype('uint16')  # make ktran scan more contrast
-            image_overlay_ijk['ktran'] = ktran_row[-1]
-            image_spacing['ktran'] = ktran_spacing[0]
+            image_overlay_ijk['ktran'] = ktran_row['ijk']
+            image_spacing['ktran'] = ktran_spacing
+            #image_origin['ktran'] = itkimage.GetOrigin()[:2]
+            images_voxelspacing['ktran'] = ktran_spacing
             if self.builder_config.name == 'nostack':
+                bbox = self.get_bbox(ktran_row['ijk'], np.shape(image_overlay['ktran']))
                 yield ProxID + fid + pos + '-ktran', {
                     'image': np.expand_dims(image_overlay['ktran'], axis=-1),
                     'significant': significance,
@@ -444,11 +458,11 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                     'ProxID': ProxID,
                     'fid': fid,
                     'position': pos,
-                    'ijk': ktran_row[-1],
+                    'ijk': ktran_row['ijk'],
+                    'bbox': bbox,
                 }
-            ktran_ijk_list.append(ktran_row[-1])
+            ktran_ijk_list.append(ktran_row['ijk'])
                 # TODO: correct ktran volume
-
             #  in test split, use ktran's ijk as PD's ijk as they have the same resolution and spacing
 
             if split == 'Test' and 'PD' not in image_overlay:
@@ -458,11 +472,13 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                         PD_DCMSerDescr = key
                 assert PD_DCMSerDescr is not None
                 PD_ijk = image_overlay_ijk['ktran']
-                image, spacing = self.get_image(PD_DCMSerDescr, PD_ijk, path + dycom_path, images_location, images_number)
-                self.add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, PD_DCMSerDescr, PD_ijk, image, spacing)
+                image, spacing, origin = self.get_image(PD_DCMSerDescr, PD_ijk, path + dycom_path, images_location, images_number)
+                self.add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_origin, PD_DCMSerDescr, PD_ijk, image, spacing, origin)
+                images_voxelspacing['PD'] = images_voxelspacing['ktran']
                 if ijk not in images_ijk[PD_DCMSerDescr]:
                     images_ijk[PD_DCMSerDescr].append(PD_ijk)
                 if self.builder_config.name == 'nostack':
+                    bbox = self.get_bbox(PD_ijk, np.shape(image))
                     yield ProxID + fid + PD_DCMSerDescr + pos, {
                         'image': np.expand_dims(image, axis=2),
                         'significant': significance,
@@ -473,14 +489,15 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                         'fid': fid,
                         'position': pos,
                         'ijk': PD_ijk,
+                        'bbox': bbox,
                     }
 
-
             #  overlay images and yield stack
-
             if self.builder_config.name == 'stack':
                 assert len(image_overlay.keys()) == 4
-                overlay_image = self.overlay_images(image_overlay, image_overlay_ijk, image_spacing)
+                #overlay_image = self.overlay_images(image_overlay, image_overlay_ijk, image_spacing)
+                overlay_image = self.get_2d_resample(image_overlay, image_spacing, image_origin)
+                bbox = self.get_bbox(image_overlay_ijk['ktran'], np.shape(overlay_image))
                 yield ProxID + fid + pos + '-stack', {
                     'image': overlay_image,
                     'significant': significance,
@@ -490,7 +507,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                     'ProxID': ProxID,
                     'fid': fid,
                     'position': pos,
-                    'ijk': ' '.join(image_overlay_ijk['ref']),
+                    'ijk': image_overlay_ijk['ktran'],
+                    'bbox': bbox,
                 }
 
             prevID = ProxID  # update prevID
@@ -501,7 +519,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         # process the last ProxID's volume
         if self.builder_config.name == 'volume':
             for key in images_location:
-                image_series = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
+                image_series, img_origin, img_spacing = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
+                bbox_list = self.get_bbox_list(images_ijk[key], np.shape(image_series[0]))
                 yield prevID + key + '-volume', {
                     'image': image_series,
                     'significant': significance_list,
@@ -512,8 +531,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                     'fid': fid_list,
                     'position': pos_list,
                     'ijk': images_ijk[key],
+                    'bbox': bbox_list,
                 }
             ktran_images = self.get_ktran_series(scan)
+            bbox_list = self.get_bbox_list(ktran_ijk_list, np.shape(ktran_images[0]))
             yield prevID + '-ktran' + '-volume', {
                 'image': ktran_images,
                 'significant': significance_list,
@@ -524,4 +545,19 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 'fid': fid_list,
                 'position': pos_list,
                 'ijk': ktran_ijk_list,
+                'bbox': bbox_list,
             }
+            """img_stack_volume = self.get_resample(images_location, path + dycom_path, images_number, images_voxelspacing, ktran_itk)
+            yield prevID + '-stack' + '-volume', {
+                'image': img_stack_volume,
+                'significant': significance_list,
+                'ggg': ggg_list,
+                'zone': zone_list,
+                'DCMSerDescr': 'stack_volume',
+                'ProxID': prevID,
+                'fid': fid_list,
+                'position': pos_list,
+                'ijk': ktran_ijk_list,
+                'bbox': bbox_list,
+            }"""
+            #spacial aligned image volume (Not good)
