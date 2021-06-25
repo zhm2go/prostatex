@@ -65,6 +65,14 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             name='stack',
             description=_DESCRIPTION,
         ),
+        ProstateXConfig(
+            name='nostack',
+            description=_DESCRIPTION,
+        ),
+        ProstateXConfig(
+            name='volume',
+            description=_DESCRIPTION,
+        ),
     ]
 
     def _info(self) -> tfds.core.DatasetInfo:
@@ -133,7 +141,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
         ijk = ijk.split()
         k = int(ijk[-1]) if int(ijk[-1]) < int(images_number[DCMSerDescr]) else int(images_number[DCMSerDescr]) - 1
         k = 0 if k < 0 else k
-        k = int(images_number[DCMSerDescr]) - k
+        if 'cor' in DCMSerDescr or 'sag' in DCMSerDescr:
+            k = k + 1  # for coronal and sagital plane, the image sequence are straight
+        else:
+            k = int(images_number[DCMSerDescr]) - k  # for transverse, reverse the sequence
         if int(k) < 10 and int(images_number[DCMSerDescr]) >= 10:
             file_name = "1-0{0}.dcm".format(k)
         else:
@@ -199,12 +210,18 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
     @staticmethod
     def get_image_series(num_slice, path, images_location, DCMSerDescr):
         img_list = []
-        for k in range(num_slice, 0, -1):
+        start, end, step = 0, 0, 0
+        if 'cor' or 'sag' in DCMSerDescr:
+            start, end, step = 1, num_slice + 1, 1
+        else:  # reverse the series of transverse
+            start, end, step = num_slice, 0, -1
+        for k in range(start, end, step):
             if int(k) < 10 and int(num_slice) >= 10:
                 file_name = "1-0{0}.dcm".format(k)
             else:
                 file_name = "1-{0}.dcm".format(k)
-            whole_path = path + '/manifest' + images_location[
+
+            whole_path = path + images_location[
                 DCMSerDescr.replace("_", "").replace("=", "")] + '/' + file_name
             image = tf.io.gfile.GFile(whole_path, mode='rb')
             image_dc = pydicom.dcmread(image)
@@ -304,7 +321,7 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
             if prevID != ProxID and len(images_location) > 0:  # implicitly ktran scan is not None
                 if self.builder_config.name == 'volume':
                     for key in images_location:
-                        image_series = self.get_image_series(images_number[key], path, images_location, key)
+                        image_series = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
                         bbox_list = self.get_bbox_list(images_ijk[key], np.shape(image_series[0]))
                         yield prevID + key + '-volume', {
                             'image': image_series,
@@ -380,8 +397,8 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
                 image, spacing, origin = self.get_image(DCMSerDes, ijk, path + dycom_path, images_location, images_number)
                 self.add_to_overlay(image_overlay, image_overlay_ijk, image_spacing, image_origin, image_name, ijk, image, spacing, origin)
                 DCMSerDes = image_row[-2].replace('_', '').replace('=', '')
-                if image_row['DCMSerDescr'] not in images_ijk[DCMSerDes]:
-                    images_ijk[DCMSerDes].append(image_row['DCMSerDescr'])
+                if ijk not in images_ijk[DCMSerDes]:
+                    images_ijk[DCMSerDes].append(ijk)
                 if self.builder_config.name == 'nostack':
                     bbox = self.get_bbox(ijk, np.shape(image))
                     yield str(ProxID) + str(fid) + image_row['Name'] + str(image_row['DCMSerNum']) + image_row[
@@ -478,12 +495,12 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
             prevID = ProxID  # update prevID
             itera += 1
-            if itera >= 10:
+            if itera >= 1:
                 break
 
         if self.builder_config.name == 'volume':
             for key in images_location:
-                image_series = self.get_image_series(images_number[key], path, images_location, key)
+                image_series = self.get_image_series(images_number[key], path + dycom_path, images_location, key)
                 bbox_list = self.get_bbox_list(images_ijk[key], np.shape(image_series[0]))
                 yield prevID + key + '-volume', {
                     'image': image_series,

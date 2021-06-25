@@ -145,7 +145,10 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
 
         k = int(ijk[-1]) if int(ijk[-1]) < int(images_number[DCMSerDescr]) else int(images_number[DCMSerDescr]) - 1
         k = 0 if k < 0 else k
-        k = int(images_number[DCMSerDescr]) - k
+        if 'cor' in DCMSerDescr or 'sag' in DCMSerDescr:
+            k = k + 1  # for coronal and sagital plane, the image sequence are straight
+        else:
+            k = int(images_number[DCMSerDescr]) - k  # for transverse, reverse the sequence
         if int(k) < 10 and int(images_number[DCMSerDescr]) >= 10:
             file_name = "1-0{0}.dcm".format(k)
         else:
@@ -161,7 +164,12 @@ class Prostatex(tfds.core.GeneratorBasedBuilder):
     @staticmethod
     def get_image_series(num_slice, path, images_location, DCMSerDescr):
         img_list, img_origin, img_spacing = [], None, None
-        for k in range(num_slice, 0, -1):
+        start, end, step = 0, 0, 0
+        if 'cor' or 'sag' in DCMSerDescr:
+            start, end, step = 1, num_slice + 1, 1
+        else:  # reverse the series of transverse
+            start, end, step = num_slice, 0, -1
+        for k in range(start, end, step):
             if int(k) < 10 and int(num_slice) >= 10:
                 file_name = "1-0{0}.dcm".format(k)
             else:
